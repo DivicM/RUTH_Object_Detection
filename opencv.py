@@ -1,102 +1,147 @@
 import numpy as np
 import cv2
-import os
+import time
 
-frame_width = 640
-frame_height = 480
-
-KNOWN_WIDTH = 6.0      # cm
-KNOWN_DISTANCE = 40.0  # cm
-
-FOCAL_FILE = "focal_length.npy"
+frame_width = 320
+frame_height = 240
 
 
-if os.path.exists(FOCAL_FILE):
-    FOCAL_LENGTH = np.load(FOCAL_FILE)
-    print(f"Ucitan FOCAL_LENGTH: {FOCAL_LENGTH}")
-else:
-    FOCAL_LENGTH = None
+FOLLOW_LANE = "FOLLOW_LANE"
+AVOID_RED = "AVOID_RED"
+AVOID_GREEN = "AVOID_GREEN"
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+state = FOLLOW_LANE
+
+last_obstacle_time = 0
+OBSTACLE_COOLDOWN = 2.0  # sekunde
+
+turn_start = 0
+TURN_TIME = 0.5
+
+cap = cv2.VideoCapture(0)
 
 if not cap.isOpened():
-    print("Error opening video stream")
+    print("Camera error")
     exit()
+
 
 while True:
     ret, frame = cap.read()
-
     if not ret:
-        print("Can't receive frame")
         break
 
     frame = cv2.resize(frame, (frame_width, frame_height))
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # CRVENA
-    lower_red1 = np.array([0, 120, 100])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 120, 100])
-    upper_red2 = np.array([180, 255, 255])
+    roi = frame[int(frame_height*0.6):frame_height, :]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
 
-    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) | \
-               cv2.inRange(hsv, lower_red2, upper_red2)
+    _, thresh = cv2.threshold(blur, 90, 255, cv2.THRESH_BINARY_INV)
 
-    # ZELENA
-    lower_green = np.array([25, 80, 50])
-    upper_green = np.array([95, 255, 255])
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    lane_center = frame_width // 2
+
+    if len(contours) > 0:
+        biggest = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(biggest)
+
+        lane_center = x + w // 2
+
+        cv2.rectangle(roi, (x,y), (x+w,y+h), (255,255,255), 2)
+
+    lower_red1 = np.array([0,120,100])
+    upper_red1 = np.array([10,255,255])
+    lower_red2 = np.array([170,120,100])
+    upper_red2 = np.array([180,255,255])
+
+    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) | cv2.inRange(hsv, lower_red2, upper_red2)
+
+    lower_green = np.array([25,80,50])
+    upper_green = np.array([95,255,255])
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
 
-    kernel = np.ones((5, 5), np.uint8)
+    kernel = np.ones((5,5), np.uint8)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
 
-    key = cv2.waitKey(1) & 0xFF  
 
-    for color_name, mask, box_color in [
-        ("RED", mask_red, (0, 0, 255)),
-        ("GREEN", mask_green, (0, 255, 0))
-    ]:
+    def detect_obstacle(mask, color):
+        global state, last_obstacle_time, turn_start
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
 
-            if area < 1000:
+            if area < 4000:
                 continue
 
             x, y, w, h = cv2.boundingRect(cnt)
+            center_x = x + w // 2
 
-            aspect_ratio = w / float(h)
-            if 0.5 < aspect_ratio < 2.0:
+            # debounce (ne reagira stalno)
+            if time.time() - last_obstacle_time < OBSTACLE_COOLDOWN:
+                return
 
-                cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 3)
+            last_obstacle_time = time.time()
 
-                
-                if key == ord('c'):
-                    FOCAL_LENGTH = (w * KNOWN_DISTANCE) / KNOWN_WIDTH
-                    np.save(FOCAL_FILE, FOCAL_LENGTH)
-                    print(f"FOCAL LENGTH spremljen: {FOCAL_LENGTH}")
+            if color == "RED":
+                state = AVOID_RED
+                turn_start = time.time()
 
-                
-                if FOCAL_LENGTH is not None:
-                    distance = (KNOWN_WIDTH * FOCAL_LENGTH) / w
-                    text = f"{color_name} {distance:.2f} cm"
-                else:
-                    text = f"{color_name} (Press C to calibrate)"
+            elif color == "GREEN":
+                state = AVOID_GREEN
+                turn_start = time.time()
 
-                cv2.putText(frame,
-                            text,
-                            (x, y - 10),
-                            cv2.FONT_HERSHEY_COMPLEX,
-                            0.7,
-                            box_color,
-                            2)
+    detect_obstacle(mask_red, "RED")
+    detect_obstacle(mask_green, "GREEN")
+    
+    frame_center = frame_width // 2
+    error = lane_center - frame_center
 
-    cv2.imshow("ObjectDetection", frame)
+    steering = error * 0.01
 
-    if key == ord('q'):
+    command = "FORWARD"
+
+    if state == FOLLOW_LANE:
+        command = "FORWARD"
+
+    elif state == AVOID_RED:
+        command = "RIGHT"
+
+        if time.time() - turn_start > TURN_TIME:
+            state = FOLLOW_LANE
+
+    elif state == AVOID_GREEN:
+        command = "LEFT"
+
+        if time.time() - turn_start > TURN_TIME:
+            state = FOLLOW_LANE
+
+    cv2.line(frame, (frame_center, 0), (frame_center, frame_height), (255,0,0), 1)
+    cv2.line(frame, (lane_center, 0), (lane_center, frame_height), (0,255,0), 1)
+
+    cv2.putText(frame,
+                f"STATE: {state}",
+                (10,20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0,255,255),
+                2)
+
+    cv2.putText(frame,
+                f"CMD: {command}",
+                (10,50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255,255,0),
+                2)
+
+    cv2.imshow("WRO CAR", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
