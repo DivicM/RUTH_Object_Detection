@@ -1,148 +1,109 @@
-import numpy as np
+import argparse
+
 import cv2
-import time
-
-frame_width = 320
-frame_height = 240
-
-
-FOLLOW_LANE = "FOLLOW_LANE"
-AVOID_RED = "AVOID_RED"
-AVOID_GREEN = "AVOID_GREEN"
-
-state = FOLLOW_LANE
-
-last_obstacle_time = 0
-OBSTACLE_COOLDOWN = 2.0  # sekunde
-
-turn_start = 0
-TURN_TIME = 0.5
-
-cap = cv2.VideoCapture(0)
-
-if not cap.isOpened():
-    print("Camera error")
-    exit()
+q
+from car.config import FRAME_HEIGHT, FRAME_WIDTH, STEERING_GAIN
+from car.fsm import CarStateMachine
+from car.logger import StateLogger
+from car.motor import MotorController
+from car.vision import find_lane_center, obstacle_detected, obstacle_masks
 
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    frame = cv2.resize(frame, (frame_width, frame_height))
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    roi = frame[int(frame_height*0.6):frame_height, :]
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
-
-    _, thresh = cv2.threshold(blur, 90, 255, cv2.THRESH_BINARY_INV)
-
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    lane_center = frame_width // 2
-
-    if len(contours) > 0:
-        biggest = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(biggest)
-
-        lane_center = x + w // 2
-
-        cv2.rectangle(roi, (x,y), (x+w,y+h), (255,255,255), 2)
-
-    lower_red1 = np.array([0,120,100])
-    upper_red1 = np.array([10,255,255])
-    lower_red2 = np.array([170,120,100])
-    upper_red2 = np.array([180,255,255])
-
-    mask_red = cv2.inRange(hsv, lower_red1, upper_red1) | cv2.inRange(hsv, lower_red2, upper_red2)
-
-    lower_green = np.array([25,80,50])
-    upper_green = np.array([95,255,255])
-    mask_green = cv2.inRange(hsv, lower_green, upper_green)
-
-    kernel = np.ones((5,5), np.uint8)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
-    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
+def parse_args():
+    parser = argparse.ArgumentParser(description="RUTH lane-following + obstacle avoidance")
+    parser.add_argument(
+        "--source",
+        default="0",
+        help="Camera index (e.g. 0) or path to a video file (e.g. videos/video1.mp4)",
+    )
+    parser.add_argument(
+        "--no-motor",
+        action="store_true",
+        help="Skip sending commands over serial, even if a port is configured",
+    )
+    return parser.parse_args()
 
 
-    def detect_obstacle(mask, color):
-        global state, last_obstacle_time, turn_start
+def open_source(source):
+    # A plain integer string means "camera index"; anything else is a file path.
+    if source.isdigit():
+        return cv2.VideoCapture(int(source))
+    return cv2.VideoCapture(source)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
+def main():
+    args = parse_args()
 
-            if area < 4000:
-                continue
+    cap = open_source(args.source)
+    if not cap.isOpened():
+        print(f"Could not open video source: {args.source}")
+        return
 
-            x, y, w, h = cv2.boundingRect(cnt)
-            center_x = x + w // 2
+    fsm = CarStateMachine()
+    motor = None if args.no_motor else MotorController()
+    logger = StateLogger()
 
-            # debounce (ne reagira stalno)
-            if time.time() - last_obstacle_time < OBSTACLE_COOLDOWN:
-                return
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-            last_obstacle_time = time.time()
+            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-            if color == "RED":
-                state = AVOID_RED
-                turn_start = time.time()
+            lane_center = find_lane_center(frame)
 
-            elif color == "GREEN":
-                state = AVOID_GREEN
-                turn_start = time.time()
+            mask_red, mask_green = obstacle_masks(hsv)
+            if obstacle_detected(mask_red):
+                fsm.notify_obstacle("RED")
+            if obstacle_detected(mask_green):
+                fsm.notify_obstacle("GREEN")
 
-    detect_obstacle(mask_red, "RED")
-    detect_obstacle(mask_green, "GREEN")
-    
-    frame_center = frame_width // 2
-    error = lane_center - frame_center
+            frame_center = FRAME_WIDTH // 2
+            error = lane_center - frame_center
+            steering = error * STEERING_GAIN
 
-    steering = error * 0.01
+            command = fsm.command()
 
-    command = "FORWARD"
+            if motor is not None:
+                motor.send(command)
 
-    if state == FOLLOW_LANE:
-        command = "FORWARD"
+            logger.log(fsm.state, command, lane_center, steering)
 
-    elif state == AVOID_RED:
-        command = "RIGHT"
+            cv2.line(frame, (frame_center, 0), (frame_center, FRAME_HEIGHT), (255, 0, 0), 1)
+            cv2.line(frame, (lane_center, 0), (lane_center, FRAME_HEIGHT), (0, 255, 0), 1)
 
-        if time.time() - turn_start > TURN_TIME:
-            state = FOLLOW_LANE
-
-    elif state == AVOID_GREEN:
-        command = "LEFT"
-
-        if time.time() - turn_start > TURN_TIME:
-            state = FOLLOW_LANE
-
-    cv2.line(frame, (frame_center, 0), (frame_center, frame_height), (255,0,0), 1)
-    cv2.line(frame, (lane_center, 0), (lane_center, frame_height), (0,255,0), 1)
-
-    cv2.putText(frame,
-                f"STATE: {state}",
-                (10,20),
+            cv2.putText(
+                frame,
+                f"STATE: {fsm.state}",
+                (10, 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (0,255,255),
-                2)
-
-    cv2.putText(frame,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                frame,
                 f"CMD: {command}",
-                (10,50),
+                (10, 50),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (255,255,0),
-                2)
+                (255, 255, 0),
+                2,
+            )
 
-    cv2.imshow("WRO CAR", frame)
+            cv2.imshow("WRO CAR", frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        logger.close()
+        if motor is not None:
+            motor.close()
 
-cap.release()
-cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
