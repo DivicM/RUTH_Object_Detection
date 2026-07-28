@@ -1,7 +1,7 @@
 import argparse
 
 import cv2
-q
+
 from car.config import FRAME_HEIGHT, FRAME_WIDTH, STEERING_GAIN
 from car.fsm import CarStateMachine
 from car.logger import StateLogger
